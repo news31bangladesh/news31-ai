@@ -8,11 +8,18 @@ Outputs in the work dir:
   card.png   - 1080x1920 motion title card (logo + headline),
                used ONLY when no footage could be downloaded.
 
-Needs a Bangla font on the machine (the workflow installs
-fonts-bengali). Pillow's wheels ship with libraqm, so conjuncts
-shape correctly. Never fails the job: when a font cannot be found
-at all, the text PNGs are skipped and the Reel is built without
-that overlay.
+The Bengali font is BUNDLED in the repo (assets/fonts/
+HindSiliguri-Bold.ttf + HindSiliguri-Regular.ttf) and is always
+used first. The runner's system fonts are NOT trusted: run #12
+used the system Lohit font and STILL produced tofu boxes in the
+Reel, while the same code + font renders correctly on other
+machines. Every font is verified to actually cover Bengali
+(fontTools cmap check) before use, and Pillow renders with
+libraqm (layout_engine=RAQM) so conjuncts shape correctly.
+
+FAIL LOUD: if no Bengali-capable font can be found, this script
+exits non-zero with "[assets] FATAL: no Bengali font" - a failed
+job is better than a box-filled Reel. Never draw tofu silently.
 """
 import argparse
 import glob
@@ -28,6 +35,11 @@ GOLD = (212, 175, 55, 255)
 WHITE = (255, 255, 255, 255)
 DARK_BAND = (0, 0, 0, 190)
 
+# Codepoints a font MUST have to render Bengali at all:
+# অ আ ক ্ া । ৯
+BENGALI_PROBE = (0x0985, 0x0986, 0x0995, 0x09CD, 0x09BE, 0x0964, 0x09EF)
+
+# System fonts - backup only, and only if verified Bengali-capable.
 FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/lohit-bengali/Lohit-Bengali.ttf",
     "/usr/share/fonts/truetype/noto/NotoSansBengali-Bold.ttf",
@@ -37,26 +49,99 @@ FONT_CANDIDATES = [
 ]
 
 
-def find_font():
+def _repo_root():
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def bundled_font(bold=True):
+    """The Bengali font shipped in the repo - always tried first.
+    Returns the path if the file exists, else None."""
+    name = "HindSiliguri-Bold.ttf" if bold else "HindSiliguri-Regular.ttf"
+    p = os.path.join(_repo_root(), "assets", "fonts", name)
+    return p if os.path.exists(p) else None
+
+
+def covers_bengali(path):
+    """True if the font's cmap has every Bengali codepoint we need.
+    Returns None when fontTools is unavailable (cannot verify)."""
+    try:
+        from fontTools.ttLib import TTFont
+    except Exception:
+        return None
+    try:
+        cmap = TTFont(path).getBestCmap()
+    except Exception:
+        return False
+    return all(cp in cmap for cp in BENGALI_PROBE)
+
+
+def _verified(path, what):
+    """Accept a font only if it is verified Bengali-capable.
+    Returns the path, or None (with a log line) if rejected."""
+    check = covers_bengali(path)
+    if check is True:
+        return path
+    if check is False:
+        print("[assets] rejecting %s: no Bengali coverage" % what,
+              file=sys.stderr)
+        return None
+    # fontTools unavailable - cannot verify, so do not trust it.
+    print("[assets] cannot verify %s (no fontTools) - skipping" % what,
+          file=sys.stderr)
+    return None
+
+
+def find_font(bold=True):
+    """Bengali font, bundled first, then system fonts - every one
+    verified to actually cover Bengali. Never returns a font that
+    cannot render Bengali, and never falls back to 'any .ttf' (a
+    Latin-only font would draw tofu boxes). Returns None when no
+    Bengali-capable font exists - the caller must fail loudly."""
+    # 1. Bundled font (pre-verified by the package author).
+    p = bundled_font(bold)
+    if p:
+        check = covers_bengali(p)
+        if check is not False:
+            print("[assets] bundled font: %s" % p)
+            return p
+        print("[assets] rejecting bundled font: no Bengali coverage",
+              file=sys.stderr)
+    else:
+        print("[assets] bundled font missing - trying system fonts",
+              file=sys.stderr)
+    if bold:
+        p = bundled_font(False)
+        if p:
+            check = covers_bengali(p)
+            if check is not False:
+                print("[assets] bundled font (regular): %s" % p)
+                return p
+    # 2. System candidates - only if verified Bengali-capable.
     for p in FONT_CANDIDATES:
         if os.path.exists(p):
-            return p
+            got = _verified(p, p)
+            if got:
+                return got
     for pat in ("/usr/share/fonts/**/NotoSansBengali*.ttf",
                 "/usr/share/fonts/**/Lohit-Bengali*.ttf",
                 "/usr/share/fonts/**/NotoSerifBengali*.ttf"):
         hits = sorted(glob.glob(pat, recursive=True))
-        if hits:
-            return hits[0]
+        for p in hits:
+            got = _verified(p, p)
+            if got:
+                return got
+    # 3. fontconfig match for Bengali - only if verified.
     try:
         r = subprocess.run(["fc-match", "-f", "%{file}", ":lang=bn"],
                            capture_output=True, text=True, timeout=20)
         p = (r.stdout or "").strip()
         if p and os.path.exists(p):
-            return p
+            got = _verified(p, p)
+            if got:
+                return got
     except Exception:
         pass
-    hits = sorted(glob.glob("/usr/share/fonts/**/*.ttf", recursive=True))
-    return hits[0] if hits else None
+    return None
 
 
 def find_lat_font():
@@ -74,7 +159,23 @@ def find_lat_font():
     return hits[0] if hits else FONT_PATH
 
 
+def _raqm_layout():
+    try:
+        return ImageFont.Layout.RAQM
+    except Exception:
+        return None
+
+
 def font(path, size):
+    """Font with libraqm shaping (proper Bengali conjuncts). Falls
+    back to Pillow's default layout only when RAQM is unavailable."""
+    layout = _raqm_layout()
+    if layout is not None:
+        try:
+            return ImageFont.truetype(path, size, layout_engine=layout)
+        except Exception as e:
+            print("[assets] RAQM failed (%s) - using default layout" % e,
+                  file=sys.stderr)
     return ImageFont.truetype(path, size)
 
 
@@ -211,21 +312,22 @@ def main():
     headline = (story.get("title") or "").strip()
     os.makedirs(args.work, exist_ok=True)
 
-    FONT_PATH = find_font()
-    made = {}
+    FONT_PATH = find_font(bold=True)
     if not FONT_PATH:
-        print("[assets] no Bangla font found - overlays skipped",
+        print("[assets] FATAL: no Bengali font - cannot render Bengali "
+              "text. Refusing to build a box-filled Reel.",
               file=sys.stderr)
-    else:
-        print("[assets] font: %s" % FONT_PATH)
-        try:
-            made["lower"] = make_lower(headline, args.work)
-        except Exception as e:
-            print("[assets] lower-third failed: %s" % e)
-        try:
-            made["ticker"] = make_ticker(headline, args.work)
-        except Exception as e:
-            print("[assets] ticker failed: %s" % e)
+        return 1
+    print("[assets] font: %s" % FONT_PATH)
+    made = {}
+    try:
+        made["lower"] = make_lower(headline, args.work)
+    except Exception as e:
+        print("[assets] lower-third failed: %s" % e)
+    try:
+        made["ticker"] = make_ticker(headline, args.work)
+    except Exception as e:
+        print("[assets] ticker failed: %s" % e)
     try:
         made["card"] = make_card(headline, args.logo, args.work)
     except Exception as e:
