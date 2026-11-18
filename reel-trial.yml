@@ -1,0 +1,135 @@
+# News 31 — ONE-Reel trial (GitHub Actions)
+#
+# Proves a Reel can be built online, for free, without the laptop:
+# newest blog story -> Bangla voiceover (edge-tts) -> YouTube footage
+# clips (v8.7/v8.7.1 rules) -> 30s 9:16 Reel with News 31 branding.
+#
+# Manual run only (workflow_dispatch). No schedule yet - this is the
+# trial. Uploads are OPTIONAL: when the secrets are not set, the
+# Reel is still built and saved as a workflow artifact, and the
+# upload steps are skipped cleanly (never fail the job).
+#
+# Secrets (repo Settings -> Secrets and variables -> Actions):
+#   FB_PAGE_TOKEN          - News 31 Page token (optional for trial)
+#   YOUTUBE_CLIENT_ID      - Google OAuth client id (optional)
+#   YOUTUBE_CLIENT_SECRET  - Google OAuth client secret (optional)
+#   YOUTUBE_REFRESH_TOKEN  - News 31 YouTube refresh token (optional)
+# NEVER put a token value in this file or any file in the repo.
+# NOTE: `secrets` cannot be used in `if:` (GitHub rejects it) - secrets are
+# mapped to job-level env below, and steps test env.* instead.
+name: Reel trial (one Reel)
+
+on:
+  workflow_dispatch:
+    inputs:
+      story_url:
+        description: "Blog post URL (optional - blank = newest post)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  reel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      FB_PAGE_TOKEN: ${{ secrets.FB_PAGE_TOKEN }}
+      YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+      YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+      YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg fonts-beng
+          python3 -m pip install --quiet --upgrade pip
+          python3 -m pip install --quiet -r scripts/requirements.txt
+
+      - name: Fetch newest story
+        run: |
+          mkdir -p work
+          python3 scripts/fetch_story.py --out work/story.json --url "${{ inputs.story_url }}"
+
+      - name: Voiceover (edge-tts, Bangla)
+        run: |
+          python3 scripts/make_voice.py --story work/story.json --out work/voice.mp3
+          ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 work/voice.mp3
+
+      - name: Collect footage (YouTube, v8.7/v8.7.1 rules)
+        run: |
+          python3 scripts/collect_footage.py --story work/story.json --voice work/voice.mp3 --work work --out work/clips.json
+
+      - name: Make overlays (lower-third, ticker, motion card)
+        run: |
+          python3 scripts/make_assets.py --story work/story.json --work work --logo assets/news31-logo.png
+
+      - name: Build Reel (1080x1920, max 30s)
+        run: |
+          python3 scripts/build_reel.py --story work/story.json --voice work/voice.mp3 --clips work/clips.json --work work --logo assets/news31-logo.png --out work/reel.mp4
+
+      - name: Trial log
+        if: always()
+        run: |
+          mkdir -p work
+          python3 - <<'EOF'
+          import json, os
+          lines = ["News 31 Reel trial - summary", ""]
+          try:
+              s = json.load(open("work/story.json"))
+              lines += ["Story: %s" % s["title"], "URL: %s" % s["url"],
+                        "Published: %s" % s.get("published", "")]
+          except Exception as e:
+              lines.append("Story: UNREADABLE (%s)" % e)
+          try:
+              m = json.load(open("work/meta.json"))
+              lines += ["", "Reel: %.1fs, %.2f MB" % (m["duration_seconds"], m["size_mb"]),
+                        "Footage: %s" % ("yes" if m["footage"] else "no - motion card"),
+                        "Footage source: %s" % (m.get("footage_source") or "-")]
+          except Exception:
+              lines.append("")
+              lines.append("Reel: NOT BUILT (see job log above)")
+          try:
+              c = json.load(open("work/clips.json"))
+              lines.append("Clips: %d" % len(c.get("clips") or []))
+          except Exception:
+              pass
+          lines.append("")
+          lines.append("Uploads: Facebook %s, YouTube %s (see steps above)"
+                       % ("attempted" if os.environ.get("FB_PAGE_TOKEN") else "skipped - no secret",
+                          "attempted" if os.environ.get("YOUTUBE_REFRESH_TOKEN") else "skipped - no secret"))
+          open("work/trial-log.txt", "w", encoding="utf-8").write("\n".join(lines) + "\n")
+          print("\n".join(lines))
+          EOF
+        env:
+          FB_PAGE_TOKEN: ${{ secrets.FB_PAGE_TOKEN }}
+          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+
+      - name: Upload Reel as artifact (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reel-trial
+          path: |
+            work/reel.mp4
+            work/caption.txt
+            work/meta.json
+            work/trial-log.txt
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload to Facebook Page (optional)
+        if: ${{ env.FB_PAGE_TOKEN != '' }}
+        run: |
+          python3 scripts/upload_facebook.py --video work/reel.mp4 --caption work/caption.txt
+
+      - name: Upload to YouTube as Short (optional)
+        if: ${{ env.YOUTUBE_REFRESH_TOKEN != '' }}
+        run: |
+          TITLE=$(python3 -c "import json; print(json.load(open('work/story.json'))['title'])")
+          URL=$(python3 -c "import json; print(json.load(open('work/story.json'))['url'])")
+          python3 scripts/upload_youtube.py --video work/reel.mp4 --title "$TITLE" --url "$URL" --caption "$(cat work/caption.txt)"
