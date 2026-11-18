@@ -4,7 +4,13 @@
 
 Same rules as the laptop AI (v8.7 + v8.7.1 field-footage fix):
   * yt-dlp search by headline keywords; pick the first short report
-    (20s-12min, not live); download at most 720p.
+    (20s-12min, not live); download at most 720p. The search tries
+    YouTube player clients in order (android, web, plain) - YouTube
+    often blocks plain searches from datacenter IPs, and the android
+    client usually gets through. Every attempt is logged, with the
+    stderr tail when it fails, so a silent "no footage" is
+    diagnosable from the run log. A search that finds nothing is
+    retried once with a shorter query (first 4 words).
   * Skip the ANCHOR parts - the field report is in the middle:
     videos >= 60s lose the first 15s + last 10s; shorter videos lose
     the first 25% + last 15%. Clips are planned middle-first.
@@ -34,6 +40,7 @@ FORMAT_HEIGHT = 720
 SEARCH_RESULTS = 5
 MAX_VIDEO_SECONDS = 720
 MIN_VIDEO_SECONDS = 20
+PLAYER_CLIENTS = ["android", "web", None]  # None = plain, no extractor-args
 ANCHOR_SKIP_HEAD = 15      # >= 60s videos: skip first 15s (anchor intro)
 ANCHOR_SKIP_TAIL = 10      # >= 60s videos: skip last 10s (anchor outro)
 SHORT_SKIP_HEAD_FRAC = 0.25
@@ -74,15 +81,20 @@ def search_query(title):
     return " ".join(words[:8]) or title
 
 
-def search_youtube(query, ytdlp):
-    cmd = ytdlp + ["--dump-json", "--no-playlist", "--no-warnings",
-                   "--quiet", "ytsearch%d:%s" % (SEARCH_RESULTS, query)]
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-    except Exception:
-        return []
+def short_query(query):
+    """First 4 words of a search query - a broader retry when the
+    full query finds nothing."""
+    return " ".join((query or "").split()[:4])
+
+
+def _stderr_tail(text, max_lines=3):
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    return " | ".join(lines[-max_lines:])
+
+
+def _parse_search_json(stdout):
     out = []
-    for line in (r.stdout or "").splitlines():
+    for line in (stdout or "").splitlines():
         line = line.strip()
         if not line.startswith("{"):
             continue
@@ -103,18 +115,57 @@ def search_youtube(query, ytdlp):
     return out
 
 
-def download_footage(video_url, out_path, ytdlp):
+def search_youtube(query, ytdlp):
+    """Search YouTube, trying player clients in order (android, web,
+    plain). Returns (results, client) - client is the name that
+    worked, or None when nothing worked. Every attempt is logged,
+    with the stderr tail when it finds nothing, so the next failure
+    is diagnosable from the run log instead of silent."""
+    for client in PLAYER_CLIENTS:
+        label = client or "plain"
+        cmd = list(ytdlp) + ["--dump-json", "--no-playlist",
+                             "--no-warnings"]
+        if client:
+            cmd += ["--extractor-args",
+                    "youtube:player_client=%s" % client]
+        cmd += ["ytsearch%d:%s" % (SEARCH_RESULTS, query)]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=120)
+        except Exception as e:
+            log("search [%s] error: %s" % (label, e))
+            continue
+        results = _parse_search_json(r.stdout)
+        log("search [%s]: %d result(s)" % (label, len(results)))
+        if results:
+            return results, client
+        err = _stderr_tail(r.stderr)
+        if err:
+            log("search [%s] stderr: %s" % (label, err))
+    return [], None
+
+
+def download_footage(video_url, out_path, ytdlp, client=None):
     fmt = ("bestvideo[height<=%d][ext=mp4]/best[height<=%d][ext=mp4]/best"
            % (FORMAT_HEIGHT, FORMAT_HEIGHT))
-    cmd = ytdlp + ["-f", fmt, "--merge-output-format", "mp4",
-                   "--no-playlist", "--no-warnings", "--retries", "2",
-                   "-o", out_path, video_url]
+    cmd = list(ytdlp)
+    if client:
+        cmd += ["--extractor-args", "youtube:player_client=%s" % client]
+    cmd += ["-f", fmt, "--merge-output-format", "mp4",
+            "--no-playlist", "--no-warnings", "--retries", "2",
+            "-o", out_path, video_url]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-    except Exception:
+    except Exception as e:
+        log("download error: %s" % e)
         return False
-    return (r.returncode == 0 and os.path.exists(out_path)
-            and os.path.getsize(out_path) > 10000)
+    ok = (r.returncode == 0 and os.path.exists(out_path)
+          and os.path.getsize(out_path) > 10000)
+    if not ok:
+        err = _stderr_tail(r.stderr)
+        log("download failed (rc=%s)%s"
+            % (r.returncode, (" - " + err) if err else ""))
+    return ok
 
 
 def usable_range(src_duration):
@@ -225,7 +276,12 @@ def main():
     if not query:
         log("empty search query - motion card fallback")
         return 0
-    results = search_youtube(query, ytdlp)
+    results, client = search_youtube(query, ytdlp)
+    if not results:
+        short = short_query(query)
+        if short and short != query:
+            log("no results - retrying with shorter query: %s" % short)
+            results, client = search_youtube(short, ytdlp)
     pick = None
     for cand in results:
         dur = cand.get("duration") or 0
@@ -240,7 +296,7 @@ def main():
     src = os.path.join(args.work, "footage_%s.mp4" % pick["id"])
     if not (os.path.exists(src) and os.path.getsize(src) > 10000
             and media_duration(src) > 0):
-        if not download_footage(pick["url"], src, ytdlp):
+        if not download_footage(pick["url"], src, ytdlp, client):
             log("download failed - motion card fallback")
             return 0
     src_dur = media_duration(src)
